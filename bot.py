@@ -1,7 +1,6 @@
 import os
 import asyncio
 import sqlite3
-import logging
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -14,9 +13,6 @@ from aiogram.types import (
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -85,9 +81,18 @@ def init_db():
         db.execute("""
             CREATE TABLE IF NOT EXISTS coupons (
                 code TEXT PRIMARY KEY,
-                percent INTEGER NOT NULL
+                percent INTEGER NOT NULL,
+                max_uses INTEGER NOT NULL DEFAULT 0,
+                used_count INTEGER NOT NULL DEFAULT 0
             )
         """)
+
+        # Migrate older coupon tables. 0 = unlimited uses.
+        coupon_columns = {row["name"] for row in db.execute("PRAGMA table_info(coupons)").fetchall()}
+        if "max_uses" not in coupon_columns:
+            db.execute("ALTER TABLE coupons ADD COLUMN max_uses INTEGER NOT NULL DEFAULT 0")
+        if "used_count" not in coupon_columns:
+            db.execute("ALTER TABLE coupons ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0")
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -99,9 +104,17 @@ def init_db():
         db.execute("""
             CREATE TABLE IF NOT EXISTS user_pending (
                 user_id INTEGER PRIMARY KEY,
-                product_key TEXT
+                product_key TEXT,
+                coupon_code TEXT,
+                discount_percent INTEGER DEFAULT 0
             )
         """)
+
+        pending_columns = {row["name"] for row in db.execute("PRAGMA table_info(user_pending)").fetchall()}
+        if "coupon_code" not in pending_columns:
+            db.execute("ALTER TABLE user_pending ADD COLUMN coupon_code TEXT")
+        if "discount_percent" not in pending_columns:
+            db.execute("ALTER TABLE user_pending ADD COLUMN discount_percent INTEGER DEFAULT 0")
 
         defaults = {
             "card_number": DEFAULT_CARD_NUMBER,
@@ -270,6 +283,11 @@ class EditProductStates(StatesGroup):
 class CouponStates(StatesGroup):
     code = State()
     percent = State()
+    max_uses = State()
+
+
+class PurchaseCouponStates(StatesGroup):
+    code = State()
 
 
 class PaymentStates(StatesGroup):
@@ -373,46 +391,121 @@ async def buy_product(callback: CallbackQuery):
 
     with get_db() as db:
         product = db.execute(
-            """
-            SELECT *
-            FROM products
-            WHERE product_key=? AND enabled=1
-            """,
+            "SELECT * FROM products WHERE product_key=? AND enabled=1",
             (key,),
         ).fetchone()
 
-    if not product:
-        await callback.answer("این محصول وجود ندارد.", show_alert=True)
-        return
+        if not product:
+            await callback.answer("این محصول وجود ندارد.", show_alert=True)
+            return
 
-    with get_db() as db:
+        # Starting a new product clears any coupon from the previous purchase.
         db.execute(
             """
-            INSERT INTO user_pending(user_id, product_key)
-            VALUES (?, ?)
-            ON CONFLICT(user_id)
-            DO UPDATE SET product_key=excluded.product_key
+            INSERT INTO user_pending(user_id, product_key, coupon_code, discount_percent)
+            VALUES (?, ?, NULL, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                product_key=excluded.product_key,
+                coupon_code=NULL,
+                discount_percent=0
             """,
             (callback.from_user.id, key),
         )
         db.commit()
 
+    await show_purchase(callback, product)
+    await callback.answer()
+
+
+async def show_purchase(callback_or_message, product):
+    user_id = callback_or_message.from_user.id
+    with get_db() as db:
+        pending = db.execute(
+            "SELECT coupon_code, discount_percent FROM user_pending WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+
+    percent = int(pending["discount_percent"] or 0) if pending else 0
+    final_price = product["price"] - (product["price"] * percent // 100)
     card_number = get_setting("card_number", DEFAULT_CARD_NUMBER)
     card_name = get_setting("card_name", DEFAULT_CARD_NAME)
     support = get_setting("support", DEFAULT_SUPPORT)
 
+    price_text = f"💰 قیمت: <b>{money(product['price'])} تومان</b>"
+    if percent:
+        price_text += (
+            f"\n🎟️ تخفیف: <b>{percent}٪</b>"
+            f"\n💵 مبلغ نهایی: <b>{money(final_price)} تومان</b>"
+        )
+
     text = (
         f"🛒 <b>{product['title']}</b>\n\n"
         f"{product['description']}\n\n"
-        f"💰 قیمت: <b>{money(product['price'])} تومان</b>\n\n"
+        f"{price_text}\n\n"
         f"💳 شماره کارت:\n<code>{card_number}</code>\n\n"
         f"👤 به نام: <b>{card_name}</b>\n\n"
         "بعد از پرداخت، عکس رسید را همینجا ارسال کنید.\n\n"
         f"🆘 پشتیبانی: @{support.lstrip('@')}"
     )
 
-    await callback.message.edit_text(text, parse_mode="HTML")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ وارد کردن کد تخفیف", callback_data=f"enter_coupon:{product['product_key']}")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"category_{product['category']}")],
+    ])
+    await callback_or_message.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@main_dp.callback_query(F.data.startswith("enter_coupon:"))
+async def enter_coupon_start(callback: CallbackQuery, state: FSMContext):
+    key = callback.data.split(":", 1)[1]
+    with get_db() as db:
+        product = db.execute("SELECT * FROM products WHERE product_key=? AND enabled=1", (key,)).fetchone()
+    if not product:
+        await callback.answer("محصول پیدا نشد.", show_alert=True)
+        return
+
+    await state.update_data(product_key=key)
+    await state.set_state(PurchaseCouponStates.code)
+    await callback.message.answer("🎟️ کد تخفیف را ارسال کن.\nمثال: ZAGROS20")
     await callback.answer()
+
+
+@main_dp.message(PurchaseCouponStates.code)
+async def apply_coupon(message: Message, state: FSMContext):
+    code = (message.text or "").strip().upper()
+    data = await state.get_data()
+    key = data.get("product_key")
+
+    with get_db() as db:
+        coupon = db.execute("SELECT * FROM coupons WHERE code=?", (code,)).fetchone()
+        product = db.execute("SELECT * FROM products WHERE product_key=? AND enabled=1", (key,)).fetchone()
+
+    if not product:
+        await state.clear()
+        await message.answer("❌ محصول پیدا نشد.")
+        return
+    if not coupon:
+        await message.answer("❌ کد تخفیف معتبر نیست.")
+        return
+    if coupon["max_uses"] > 0 and coupon["used_count"] >= coupon["max_uses"]:
+        await message.answer("❌ ظرفیت استفاده از این کد تخفیف تمام شده است.")
+        return
+
+    with get_db() as db:
+        db.execute(
+            "UPDATE user_pending SET coupon_code=?, discount_percent=? WHERE user_id=? AND product_key=?",
+            (code, coupon["percent"], message.from_user.id, key),
+        )
+        db.commit()
+
+    await state.clear()
+    # Rebuild the purchase message without requiring a callback.
+    class MessageWrapper:
+        def __init__(self, msg):
+            self.message = msg
+            self.from_user = msg.from_user
+    await show_purchase(MessageWrapper(message), product)
+    await message.answer(f"✅ کد {code} با تخفیف {coupon['percent']}٪ اعمال شد.")
 
 
 @main_dp.callback_query(F.data == "profile")
@@ -495,7 +588,7 @@ async def receipt(message: Message):
     with get_db() as db:
         pending = db.execute(
             """
-            SELECT p.*
+            SELECT p.*, u.coupon_code, u.discount_percent
             FROM user_pending u
             JOIN products p ON p.product_key=u.product_key
             WHERE u.user_id=? AND p.enabled=1
@@ -507,27 +600,32 @@ async def receipt(message: Message):
         await message.answer("❌ ابتدا یک محصول را انتخاب کنید.")
         return
 
+    discount_percent = int(pending["discount_percent"] or 0)
+    final_amount = pending["price"] - (pending["price"] * discount_percent // 100)
+    coupon_code = pending["coupon_code"]
+
     with get_db() as db:
+        # Consume one use only when a receipt becomes an order.
+        if coupon_code:
+            coupon = db.execute("SELECT * FROM coupons WHERE code=?", (coupon_code,)).fetchone()
+            if not coupon or (coupon["max_uses"] > 0 and coupon["used_count"] >= coupon["max_uses"]):
+                await message.answer("❌ این کد تخفیف دیگر قابل استفاده نیست. دوباره محصول را انتخاب کنید.")
+                return
+
         cursor = db.execute(
             """
             INSERT INTO orders
             (user_id, username, product_key, product_name, amount, status)
             VALUES (?, ?, ?, ?, ?, 'pending')
             """,
-            (
-                user_id,
-                message.from_user.username or "",
-                pending["product_key"],
-                pending["title"],
-                pending["price"],
-            ),
+            (user_id, message.from_user.username or "", pending["product_key"], pending["title"], final_amount),
         )
         order_id = cursor.lastrowid
 
-        db.execute(
-            "DELETE FROM user_pending WHERE user_id=?",
-            (user_id,),
-        )
+        if coupon_code:
+            db.execute("UPDATE coupons SET used_count=used_count+1 WHERE code=?", (coupon_code,))
+
+        db.execute("DELETE FROM user_pending WHERE user_id=?", (user_id,))
         db.commit()
 
     try:
@@ -545,8 +643,9 @@ async def receipt(message: Message):
         caption = (
             "🧾 <b>سفارش جدید</b>\n\n"
             f"📦 محصول: <b>{pending['title']}</b>\n"
-            f"💰 مبلغ: <b>{money(pending['price'])} تومان</b>\n"
-            f"🆔 سفارش: <b>#{order_id}</b>\n"
+            f"💰 مبلغ: <b>{money(final_amount)} تومان</b>\n"
+            + (f"🎟️ کد تخفیف: <b>{coupon_code}</b> ({discount_percent}٪)\n" if coupon_code else "")
+            + f"🆔 سفارش: <b>#{order_id}</b>\n"
             f"👤 کاربر: @{message.from_user.username or 'ندارد'}\n"
             f"🆔 User ID: <code>{user_id}</code>"
         )
@@ -1130,14 +1229,15 @@ async def admin_coupons(callback: CallbackQuery):
     else:
         for coupon in coupons:
             text += (
-                f"🎟️ <code>{coupon['code']}</code> "
-                f"→ {coupon['percent']}٪\n"
+                f"🎟️ <code>{coupon['code']}</code> → {coupon['percent']}٪\n"
+                f"📊 استفاده: {coupon['used_count']}/{'∞' if coupon['max_uses'] == 0 else coupon['max_uses']}\n"
             )
 
     await callback.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
+                *[[InlineKeyboardButton(text=f"🗑️ حذف {coupon['code']}", callback_data=f"delete_coupon:{coupon['code']}")] for coupon in coupons],
                 [InlineKeyboardButton(text="➕ افزودن کوپن", callback_data="add_coupon")],
                 [InlineKeyboardButton(text="🔙 پنل", callback_data="admin_home")],
             ]
@@ -1185,19 +1285,51 @@ async def coupon_percent(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
+    await state.update_data(percent=percent)
+    await state.set_state(CouponStates.max_uses)
+    await message.answer("🔢 حداکثر تعداد استفاده را بفرست.\nمثال: 10\nبرای استفاده نامحدود: 0")
 
+
+@admin_dp.message(CouponStates.max_uses)
+async def coupon_max_uses(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ تعداد استفاده باید عدد باشد.")
+        return
+
+    max_uses = int(text)
+    data = await state.get_data()
     with get_db() as db:
         db.execute(
             """
-            INSERT OR REPLACE INTO coupons(code, percent)
-            VALUES (?, ?)
+            INSERT OR REPLACE INTO coupons(code, percent, max_uses, used_count)
+            VALUES (?, ?, ?, COALESCE((SELECT used_count FROM coupons WHERE code=?), 0))
             """,
-            (data["code"], percent),
+            (data["code"], data["percent"], max_uses, data["code"]),
         )
         db.commit()
 
     await state.clear()
-    await message.answer("✅ کوپن ذخیره شد.", reply_markup=admin_menu())
+    limit_text = "نامحدود" if max_uses == 0 else str(max_uses)
+    await message.answer(f"✅ کوپن ذخیره شد.\n🎟️ کد: {data['code']}\n📊 تخفیف: {data['percent']}٪\n🔢 سقف استفاده: {limit_text}", reply_markup=admin_menu())
+
+
+@admin_dp.callback_query(F.data.startswith("delete_coupon:"))
+async def delete_coupon(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    code = callback.data.split(":", 1)[1].upper()
+    with get_db() as db:
+        cur = db.execute("DELETE FROM coupons WHERE code=?", (code,))
+        db.commit()
+
+    if cur.rowcount == 0:
+        await callback.answer("کوپن پیدا نشد.", show_alert=True)
+        return
+
+    await callback.answer(f"کوپن {code} حذف شد.")
+    await admin_coupons(callback)
 
 
 # =========================
@@ -1321,18 +1453,7 @@ async def save_support(message: Message, state: FSMContext):
 
 async def start_bots():
     init_db()
-    logger.info("Starting Zagros MC bots...")
-    logger.info("ADMIN_IDS: %s", sorted(ADMIN_IDS))
-
-    # Remove any old webhook before polling. This prevents Telegram from
-    # keeping the bot in webhook mode after a previous deployment.
-    await main_bot.delete_webhook(drop_pending_updates=False)
-    await admin_bot.delete_webhook(drop_pending_updates=False)
-
-    main_me = await main_bot.get_me()
-    admin_me = await admin_bot.get_me()
-    logger.info("Main bot: @%s (%s)", main_me.username, main_me.id)
-    logger.info("Admin bot: @%s (%s)", admin_me.username, admin_me.id)
+    print("Starting Zagros MC bots...")
 
     await asyncio.gather(
         main_dp.start_polling(main_bot, handle_signals=False),
