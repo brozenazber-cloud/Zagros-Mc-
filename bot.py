@@ -1,6 +1,7 @@
 import os
 import asyncio
 import sqlite3
+import logging
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -13,6 +14,9 @@ from aiogram.types import (
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -721,4 +725,624 @@ async def add_product_description(message: Message, state: FSMContext):
                     data["category"],
                     data["title"],
                     data["price"],
-                    descrip
+                    description,
+                ),
+            )
+            db.commit()
+
+        await state.clear()
+        await message.answer(
+            "✅ محصول با موفقیت اضافه شد.",
+            reply_markup=admin_menu(),
+        )
+
+    except sqlite3.IntegrityError:
+        await state.clear()
+        await message.answer(
+            "❌ این کلید محصول قبلاً استفاده شده است.",
+            reply_markup=admin_menu(),
+        )
+    except Exception as e:
+        await state.clear()
+        print(f"Add product error: {e}")
+        await message.answer(
+            "❌ هنگام اضافه کردن محصول خطایی رخ داد.",
+            reply_markup=admin_menu(),
+        )
+
+
+@admin_dp.callback_query(F.data.startswith("edit:"))
+async def edit_product(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    product_id = int(callback.data.split(":", 1)[1])
+
+    with get_db() as db:
+        product = db.execute(
+            "SELECT * FROM products WHERE id=?",
+            (product_id,),
+        ).fetchone()
+
+    if not product:
+        await callback.answer("محصول پیدا نشد.", show_alert=True)
+        return
+
+    status = "🟢 فعال" if product["enabled"] else "🔴 غیرفعال"
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📝 تغییر نام", callback_data=f"edit_title:{product_id}")],
+            [InlineKeyboardButton(text="💰 تغییر قیمت", callback_data=f"edit_price:{product_id}")],
+            [InlineKeyboardButton(text="📄 تغییر توضیحات", callback_data=f"edit_desc:{product_id}")],
+            [InlineKeyboardButton(text="🔄 فعال/غیرفعال", callback_data=f"toggle:{product_id}")],
+            [InlineKeyboardButton(text="🗑️ حذف محصول", callback_data=f"delete:{product_id}")],
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"back_products:{product['category']}")],
+        ]
+    )
+
+    await callback.message.edit_text(
+        f"📦 <b>{product['title']}</b>\n\n"
+        f"🔑 Key: <code>{product['product_key']}</code>\n"
+        f"💰 قیمت: {money(product['price'])} تومان\n"
+        f"📊 وضعیت: {status}\n\n"
+        f"{product['description']}",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@admin_dp.callback_query(F.data.startswith("edit_title:"))
+async def edit_title_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(product_id=product_id)
+    await state.set_state(EditProductStates.title)
+    await callback.message.answer("📝 نام جدید محصول را بفرست.")
+    await callback.answer()
+
+
+@admin_dp.message(EditProductStates.title)
+async def edit_title_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    with get_db() as db:
+        db.execute(
+            "UPDATE products SET title=? WHERE id=?",
+            ((message.text or "").strip(), data["product_id"]),
+        )
+        db.commit()
+
+    await state.clear()
+    await message.answer("✅ نام محصول تغییر کرد.", reply_markup=admin_menu())
+
+
+@admin_dp.callback_query(F.data.startswith("edit_price:"))
+async def edit_price_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(product_id=product_id)
+    await state.set_state(EditProductStates.price)
+    await callback.message.answer("💰 قیمت جدید را فقط به صورت عدد بفرست.")
+    await callback.answer()
+
+
+@admin_dp.message(EditProductStates.price)
+async def edit_price_finish(message: Message, state: FSMContext):
+    text = (message.text or "").strip().replace(",", "").replace("٬", "")
+
+    if not text.isdigit():
+        await message.answer("❌ قیمت باید فقط عدد باشد.")
+        return
+
+    data = await state.get_data()
+
+    with get_db() as db:
+        db.execute(
+            "UPDATE products SET price=? WHERE id=?",
+            (int(text), data["product_id"]),
+        )
+        db.commit()
+
+    await state.clear()
+    await message.answer("✅ قیمت تغییر کرد.", reply_markup=admin_menu())
+
+
+@admin_dp.callback_query(F.data.startswith("edit_desc:"))
+async def edit_description_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+
+    product_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(product_id=product_id)
+    await state.set_state(EditProductStates.description)
+    await callback.message.answer("📄 توضیحات جدید محصول را بفرست.")
+    await callback.answer()
+
+
+@admin_dp.message(EditProductStates.description)
+async def edit_description_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    with get_db() as db:
+        db.execute(
+            "UPDATE products SET description=? WHERE id=?",
+            ((message.text or "").strip(), data["product_id"]),
+        )
+        db.commit()
+
+    await state.clear()
+    await message.answer("✅ توضیحات تغییر کرد.", reply_markup=admin_menu())
+
+
+@admin_dp.callback_query(F.data.startswith("toggle:"))
+async def toggle_product(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    product_id = int(callback.data.split(":", 1)[1])
+
+    with get_db() as db:
+        product = db.execute(
+            "SELECT enabled FROM products WHERE id=?",
+            (product_id,),
+        ).fetchone()
+
+        if not product:
+            await callback.answer("محصول پیدا نشد.", show_alert=True)
+            return
+
+        new_status = 0 if product["enabled"] else 1
+        db.execute(
+            "UPDATE products SET enabled=? WHERE id=?",
+            (new_status, product_id),
+        )
+        db.commit()
+
+    # Refresh the same product screen.
+    fake_data = f"edit:{product_id}"
+    callback.data = fake_data
+    await edit_product(callback)
+
+
+@admin_dp.callback_query(F.data.startswith("delete:"))
+async def delete_product(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    product_id = int(callback.data.split(":", 1)[1])
+
+    with get_db() as db:
+        product = db.execute(
+            "SELECT category FROM products WHERE id=?",
+            (product_id,),
+        ).fetchone()
+
+        if not product:
+            await callback.answer("محصول پیدا نشد.", show_alert=True)
+            return
+
+        category = product["category"]
+        db.execute("DELETE FROM products WHERE id=?", (product_id,))
+        db.commit()
+
+    await callback.message.edit_text(
+        "✅ محصول حذف شد.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"back_products:{category}")]
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@admin_dp.callback_query(F.data.startswith("back_products:"))
+async def back_products(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    category = callback.data.split(":", 1)[1]
+    await show_products_message(callback.message, category)
+    await callback.answer()
+
+
+@admin_dp.callback_query(F.data == "admin_home")
+async def admin_home(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    await callback.message.edit_text(
+        "🛠️ <b>پنل مدیریت Zagros MC</b>",
+        reply_markup=admin_menu(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+# =========================
+# ORDERS
+# =========================
+
+@admin_dp.callback_query(F.data == "admin_orders")
+async def admin_orders(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    with get_db() as db:
+        orders = db.execute(
+            """
+            SELECT *
+            FROM orders
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+
+    if not orders:
+        text = "📦 هیچ سفارشی ثبت نشده است."
+    else:
+        text = "📦 <b>آخرین سفارش‌ها</b>\n\n"
+        for order in orders:
+            text += (
+                f"#{order['id']} | {order['product_name']}\n"
+                f"💰 {money(order['amount'])} تومان\n"
+                f"👤 {order['username'] or 'ندارد'}\n"
+                f"📌 وضعیت: {order['status']}\n\n"
+            )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 پنل", callback_data="admin_home")]
+            ]
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+async def set_order_status(order_id, status):
+    with get_db() as db:
+        order = db.execute(
+            "SELECT * FROM orders WHERE id=?",
+            (order_id,),
+        ).fetchone()
+
+        if not order:
+            return None
+
+        db.execute(
+            "UPDATE orders SET status=? WHERE id=?",
+            (status, order_id),
+        )
+        db.commit()
+
+    return order
+
+
+@admin_dp.callback_query(F.data.startswith("approve:"))
+async def approve_order(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    order_id = int(callback.data.split(":", 1)[1])
+    order = await set_order_status(order_id, "approved")
+
+    if not order:
+        await callback.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+
+    try:
+        await main_bot.send_message(
+            order["user_id"],
+            "✅ <b>سفارش شما تایید شد!</b>\n\n"
+            f"📦 محصول: {order['product_name']}\n"
+            f"🧾 شماره سفارش: #{order_id}\n\n"
+            "پرداخت شما توسط مدیریت تایید شد.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        print(f"Could not notify user: {e}")
+
+    try:
+        await callback.message.edit_caption(
+            caption=(
+                f"🧾 <b>سفارش #{order_id}</b>\n\n"
+                f"📦 محصول: <b>{order['product_name']}</b>\n"
+                f"💰 مبلغ: <b>{money(order['amount'])} تومان</b>\n"
+                "✅ <b>تایید شد</b>"
+            ),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    await callback.answer("سفارش تایید شد.")
+
+
+@admin_dp.callback_query(F.data.startswith("reject:"))
+async def reject_order(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    order_id = int(callback.data.split(":", 1)[1])
+    order = await set_order_status(order_id, "rejected")
+
+    if not order:
+        await callback.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+
+    try:
+        await main_bot.send_message(
+            order["user_id"],
+            "❌ <b>سفارش شما رد شد.</b>\n\n"
+            f"📦 محصول: {order['product_name']}\n"
+            f"🧾 شماره سفارش: #{order_id}\n\n"
+            "در صورت نیاز با پشتیبانی تماس بگیرید.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        print(f"Could not notify user: {e}")
+
+    try:
+        await callback.message.edit_caption(
+            caption=(
+                f"🧾 <b>سفارش #{order_id}</b>\n\n"
+                f"📦 محصول: <b>{order['product_name']}</b>\n"
+                f"💰 مبلغ: <b>{money(order['amount'])} تومان</b>\n"
+                "❌ <b>رد شد</b>"
+            ),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    await callback.answer("سفارش رد شد.")
+
+
+# =========================
+# COUPONS
+# =========================
+
+@admin_dp.callback_query(F.data == "admin_coupons")
+async def admin_coupons(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    with get_db() as db:
+        coupons = db.execute(
+            "SELECT * FROM coupons ORDER BY code"
+        ).fetchall()
+
+    text = "🎟️ <b>کوپن‌ها</b>\n\n"
+
+    if not coupons:
+        text += "هیچ کوپنی وجود ندارد."
+    else:
+        for coupon in coupons:
+            text += (
+                f"🎟️ <code>{coupon['code']}</code> "
+                f"→ {coupon['percent']}٪\n"
+            )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ افزودن کوپن", callback_data="add_coupon")],
+                [InlineKeyboardButton(text="🔙 پنل", callback_data="admin_home")],
+            ]
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@admin_dp.callback_query(F.data == "add_coupon")
+async def add_coupon_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.set_state(CouponStates.code)
+    await callback.message.answer("🎟️ کد کوپن را بفرست.")
+    await callback.answer()
+
+
+@admin_dp.message(CouponStates.code)
+async def coupon_code(message: Message, state: FSMContext):
+    code = (message.text or "").strip().upper()
+
+    if not code:
+        await message.answer("❌ کد کوپن نمی‌تواند خالی باشد.")
+        return
+
+    await state.update_data(code=code)
+    await state.set_state(CouponStates.percent)
+    await message.answer("📊 درصد تخفیف را بفرست.\nمثال: 20")
+
+
+@admin_dp.message(CouponStates.percent)
+async def coupon_percent(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    if not text.isdigit():
+        await message.answer("❌ درصد باید عدد باشد.")
+        return
+
+    percent = int(text)
+
+    if not 1 <= percent <= 100:
+        await message.answer("❌ درصد باید بین 1 تا 100 باشد.")
+        return
+
+    data = await state.get_data()
+
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT OR REPLACE INTO coupons(code, percent)
+            VALUES (?, ?)
+            """,
+            (data["code"], percent),
+        )
+        db.commit()
+
+    await state.clear()
+    await message.answer("✅ کوپن ذخیره شد.", reply_markup=admin_menu())
+
+
+# =========================
+# PAYMENT SETTINGS
+# =========================
+
+@admin_dp.callback_query(F.data == "admin_payment")
+async def admin_payment(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    card_number = get_setting("card_number", DEFAULT_CARD_NUMBER)
+    card_name = get_setting("card_name", DEFAULT_CARD_NAME)
+
+    await callback.message.edit_text(
+        "💳 <b>تنظیمات پرداخت</b>\n\n"
+        f"شماره کارت:\n<code>{card_number}</code>\n\n"
+        f"نام صاحب کارت: <b>{card_name}</b>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💳 تغییر شماره کارت", callback_data="change_card_number")],
+                [InlineKeyboardButton(text="👤 تغییر نام صاحب کارت", callback_data="change_card_name")],
+                [InlineKeyboardButton(text="🔙 پنل", callback_data="admin_home")],
+            ]
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@admin_dp.callback_query(F.data == "change_card_number")
+async def change_card_number(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.set_state(PaymentStates.card_number)
+    await callback.message.answer("💳 شماره کارت جدید را بفرست.")
+    await callback.answer()
+
+
+@admin_dp.message(PaymentStates.card_number)
+async def save_card_number(message: Message, state: FSMContext):
+    set_setting("card_number", (message.text or "").strip())
+    await state.clear()
+    await message.answer("✅ شماره کارت تغییر کرد.", reply_markup=admin_menu())
+
+
+@admin_dp.callback_query(F.data == "change_card_name")
+async def change_card_name(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.set_state(PaymentStates.card_name)
+    await callback.message.answer("👤 نام صاحب کارت جدید را بفرست.")
+    await callback.answer()
+
+
+@admin_dp.message(PaymentStates.card_name)
+async def save_card_name(message: Message, state: FSMContext):
+    set_setting("card_name", (message.text or "").strip())
+    await state.clear()
+    await message.answer("✅ نام صاحب کارت تغییر کرد.", reply_markup=admin_menu())
+
+
+# =========================
+# SUPPORT SETTINGS
+# =========================
+
+@admin_dp.callback_query(F.data == "admin_support")
+async def admin_support(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    username = get_setting("support", DEFAULT_SUPPORT)
+
+    await callback.message.edit_text(
+        "🆘 <b>تنظیمات پشتیبانی</b>\n\n"
+        f"پشتیبانی فعلی: @{username.lstrip('@')}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ تغییر پشتیبانی", callback_data="change_support")],
+                [InlineKeyboardButton(text="🔙 پنل", callback_data="admin_home")],
+            ]
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@admin_dp.callback_query(F.data == "change_support")
+async def change_support(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.set_state(SupportStates.username)
+    await callback.message.answer(
+        "🆘 یوزرنیم پشتیبانی را بفرست.\nمثال: IBrOzen"
+    )
+    await callback.answer()
+
+
+@admin_dp.message(SupportStates.username)
+async def save_support(message: Message, state: FSMContext):
+    username = (message.text or "").strip().lstrip("@")
+
+    if not username:
+        await message.answer("❌ یوزرنیم نمی‌تواند خالی باشد.")
+        return
+
+    set_setting("support", username)
+    await state.clear()
+    await message.answer(
+        f"✅ پشتیبانی به @{username} تغییر کرد.",
+        reply_markup=admin_menu(),
+    )
+
+
+# =========================
+# START
+# =========================
+
+async def start_bots():
+    init_db()
+    logger.info("Starting Zagros MC bots...")
+    logger.info("ADMIN_IDS: %s", sorted(ADMIN_IDS))
+
+    # Remove any old webhook before polling. This prevents Telegram from
+    # keeping the bot in webhook mode after a previous deployment.
+    await main_bot.delete_webhook(drop_pending_updates=False)
+    await admin_bot.delete_webhook(drop_pending_updates=False)
+
+    main_me = await main_bot.get_me()
+    admin_me = await admin_bot.get_me()
+    logger.info("Main bot: @%s (%s)", main_me.username, main_me.id)
+    logger.info("Admin bot: @%s (%s)", admin_me.username, admin_me.id)
+
+    await asyncio.gather(
+        main_dp.start_polling(main_bot, handle_signals=False),
+        admin_dp.start_polling(admin_bot, handle_signals=False),
+    )
+
+
+def run_bot():
+    asyncio.run(start_bots())
+
+
+if __name__ == "__main__":
+    run_bot()
