@@ -32,8 +32,6 @@ ADMIN_IDS = {
 DEFAULT_CARD_NUMBER = os.getenv("CARD_NUMBER", "").strip()
 DEFAULT_CARD_NAME = os.getenv("CARD_NAME", "").strip()
 DEFAULT_SUPPORT = os.getenv("SUPPORT_USERNAME", "IBrOzen").strip()
-DEFAULT_COIN_NAME = os.getenv("COIN_NAME", "کوین").strip() or "کوین"
-DEFAULT_COIN_ICON = os.getenv("COIN_ICON", "🪙").strip() or "🪙"
 
 if not MAIN_BOT_TOKEN:
     raise RuntimeError("MAIN_BOT_TOKEN is missing")
@@ -62,6 +60,7 @@ def init_db():
                 title TEXT NOT NULL,
                 price INTEGER NOT NULL,
                 description TEXT DEFAULT '',
+                coin_amount INTEGER DEFAULT 0,
                 enabled INTEGER DEFAULT 1,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
@@ -112,6 +111,13 @@ def init_db():
             )
         """)
 
+        product_columns = {row["name"] for row in db.execute("PRAGMA table_info(products)").fetchall()}
+        if "coin_amount" not in product_columns:
+            db.execute("ALTER TABLE products ADD COLUMN coin_amount INTEGER NOT NULL DEFAULT 0")
+
+        # Remove old OP products from previous versions.
+        db.execute("DELETE FROM products WHERE category='op'")
+
         pending_columns = {row["name"] for row in db.execute("PRAGMA table_info(user_pending)").fetchall()}
         if "coupon_code" not in pending_columns:
             db.execute("ALTER TABLE user_pending ADD COLUMN coupon_code TEXT")
@@ -122,8 +128,6 @@ def init_db():
             "card_number": DEFAULT_CARD_NUMBER,
             "card_name": DEFAULT_CARD_NAME,
             "support": DEFAULT_SUPPORT,
-            "coin_name": DEFAULT_COIN_NAME,
-            "coin_icon": DEFAULT_COIN_ICON,
         }
 
         for key, value in defaults.items():
@@ -134,9 +138,6 @@ def init_db():
                 """,
                 (key, value),
             )
-
-        # OP products are no longer part of Zagros MC.
-        db.execute("DELETE FROM products WHERE category='op'")
 
         products = [
             (
@@ -154,6 +155,7 @@ def init_db():
                 "👑 رنک LEGEND\n• کیت ندرایت\n• دسترسی به /anvil\n• دسترسی به /craft\n• دسترسی به /enchantingtable",
             ),
         ]
+
         for product in products:
             db.execute(
                 """
@@ -198,14 +200,6 @@ def money(value):
     return f"{int(value):,}".replace(",", "٬")
 
 
-def currency_label(value):
-    return f"{money(value)} {get_setting('coin_name', DEFAULT_COIN_NAME)}"
-
-
-def currency_icon():
-    return get_setting("coin_icon", DEFAULT_COIN_ICON)
-
-
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
@@ -214,6 +208,7 @@ def main_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💎 رنک‌ها", callback_data="category_rank")],
+            [InlineKeyboardButton(text="🪙 خرید Coin", callback_data="category_coin")],
             [InlineKeyboardButton(text="🐾 پت‌ها", callback_data="category_pet")],
             [InlineKeyboardButton(text="👤 پروفایل", callback_data="profile")],
             [InlineKeyboardButton(text="🆘 پشتیبانی", callback_data="support")],
@@ -225,10 +220,10 @@ def admin_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💎 مدیریت رنک‌ها", callback_data="admin_rank")],
+            [InlineKeyboardButton(text="🪙 مدیریت Coin", callback_data="admin_coin")],
             [InlineKeyboardButton(text="🐾 مدیریت پت‌ها", callback_data="admin_pet")],
             [InlineKeyboardButton(text="📦 سفارش‌ها", callback_data="admin_orders")],
             [InlineKeyboardButton(text="🎟️ کوپن‌ها", callback_data="admin_coupons")],
-            [InlineKeyboardButton(text="🪙 تنظیمات واحد پول", callback_data="admin_currency")],
             [InlineKeyboardButton(text="💳 تنظیمات پرداخت", callback_data="admin_payment")],
             [InlineKeyboardButton(text="🆘 تنظیمات پشتیبانی", callback_data="admin_support")],
         ]
@@ -293,9 +288,12 @@ class SupportStates(StatesGroup):
     username = State()
 
 
-class CurrencyStates(StatesGroup):
-    name = State()
-    icon = State()
+class CoinStates(StatesGroup):
+    key = State()
+    title = State()
+    coin_amount = State()
+    price = State()
+    description = State()
 
 
 # =========================
@@ -317,7 +315,6 @@ admin_dp = Dispatcher()
 async def start(message: Message):
     await message.answer(
         "💎 <b>به فروشگاه Zagros MC خوش آمدید!</b>\n\n"
-        f"واحد پول سرور: {currency_icon()} <b>{get_setting('coin_name', DEFAULT_COIN_NAME)}</b>\n"
         "از منوی زیر محصول موردنظر خود را انتخاب کنید.",
         reply_markup=main_menu(),
         parse_mode="HTML",
@@ -330,59 +327,36 @@ async def category(callback: CallbackQuery):
 
     with get_db() as db:
         rows = db.execute(
-            """
-            SELECT *
-            FROM products
-            WHERE category=? AND enabled=1
-            ORDER BY id
-            """,
+            "SELECT * FROM products WHERE category=? AND enabled=1 ORDER BY id",
             (category_name,),
         ).fetchall()
 
     buttons = []
-
     for row in rows:
-        if category_name == "rank":
-            if row["product_key"] == "vip":
-                icon = "💎"
-            elif row["product_key"] == "legend":
-                icon = "👑"
-            else:
-                icon = "💠"
-        else:
-            icon = "🐾"
+        icon = "💎" if category_name == "rank" else ("🪙" if category_name == "coin" else "🐾")
+        label = f"{row['coin_amount']:,}".replace(",", "٬") + " Coin" if category_name == "coin" and row['coin_amount'] else row['title']
+        buttons.append([InlineKeyboardButton(text=f"{icon} {label} — {money(row['price'])} تومان", callback_data=f"buy:{row['product_key']}")])
 
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{icon} {row['title']} — {currency_label(row['price'])}",
-                callback_data=f"buy:{row['product_key']}",
-            )
-        ])
+    if not buttons:
+        buttons.append([InlineKeyboardButton(text="❌ فعلاً محصولی موجود نیست", callback_data="noop")])
+    buttons.append([InlineKeyboardButton(text="🔙 برگشت", callback_data="back_main")])
 
-    buttons.append([
-        InlineKeyboardButton(
-            text="🔙 برگشت",
-            callback_data="back_main",
-        )
-    ])
-
-    if category_name == "rank":
-        text = (
-            "💎 <b>رنک‌های ZAGROS</b>\n\n"
-            "رنک موردنظر را انتخاب کن:"
-        )
-    else:
-        text = (
-            "🐾 <b>پت‌های ZAGROS</b>\n\n"
-            "پت موردنظر را انتخاب کن:"
-        )
-
+    titles = {
+        "rank": "💎 <b>رنک‌های ZAGROS</b>",
+        "coin": "🪙 <b>خرید Coin سرور</b>",
+        "pet": "🐾 <b>پت‌های ZAGROS</b>",
+    }
     await callback.message.edit_text(
-        text,
+        titles.get(category_name, "🛒 <b>فروشگاه ZAGROS</b>") + "\n\nمحصول موردنظر را انتخاب کن:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+@main_dp.callback_query(F.data == "noop")
+async def noop(callback: CallbackQuery):
+    await callback.answer("فعلاً محصولی موجود نیست.")
 
 
 @main_dp.callback_query(F.data.startswith("buy:"))
@@ -431,21 +405,24 @@ async def show_purchase(callback_or_message, product):
     card_name = get_setting("card_name", DEFAULT_CARD_NAME)
     support = get_setting("support", DEFAULT_SUPPORT)
 
-    price_text = f"{currency_icon()} قیمت: <b>{currency_label(product['price'])}</b>"
+    price_text = f"💰 قیمت: <b>{money(product['price'])} تومان</b>"
+    coin_line = ""
+    if product["category"] == "coin" and product["coin_amount"]:
+        coin_line = f"\n🪙 مقدار Coin: <b>{money(product['coin_amount'])} Coin</b>"
     if percent:
         price_text += (
             f"\n🎟️ تخفیف: <b>{percent}٪</b>"
-            f"\n💵 مبلغ نهایی: <b>{currency_label(final_price)}</b>"
+            f"\n💵 مبلغ نهایی: <b>{money(final_price)} تومان</b>"
         )
 
     text = (
         f"🛒 <b>{product['title']}</b>\n\n"
-        f"{product['description']}\n\n"
+        f"{product['description']}\n"
+        f"{coin_line}\n\n"
         f"{price_text}\n\n"
         f"💳 شماره کارت:\n<code>{card_number}</code>\n\n"
         f"👤 به نام: <b>{card_name}</b>\n\n"
-        "بعد از پرداخت، عکس رسید را همینجا ارسال کنید.\n"
-        f"💡 مبلغ سفارش بر اساس واحد پول سرور ({get_setting('coin_name', DEFAULT_COIN_NAME)}) ثبت می‌شود.\n\n"
+        "بعد از پرداخت، عکس رسید را همینجا ارسال کنید.\n\n"
         f"🆘 پشتیبانی: @{support.lstrip('@')}"
     )
 
@@ -543,7 +520,7 @@ async def profile(callback: CallbackQuery):
         for order in orders:
             text += (
                 f"#{order['id']} - {order['product_name']} - "
-                f"{currency_label(order['amount'])}\n"
+                f"{money(order['amount'])} تومان\n"
                 f"وضعیت: {order['status']}\n\n"
             )
 
@@ -650,7 +627,8 @@ async def receipt(message: Message):
         caption = (
             "🧾 <b>سفارش جدید</b>\n\n"
             f"📦 محصول: <b>{pending['title']}</b>\n"
-            f"💰 مبلغ: <b>{currency_label(final_amount)}</b>\n"
+            + (f"🪙 Coin: <b>{money(pending['coin_amount'])}</b>\n" if pending["category"] == "coin" and pending["coin_amount"] else "")
+            + f"💰 مبلغ: <b>{money(final_amount)} تومان</b>\n"
             + (f"🎟️ کد تخفیف: <b>{coupon_code}</b> ({discount_percent}٪)\n" if coupon_code else "")
             + f"🆔 سفارش: <b>#{order_id}</b>\n"
             f"👤 کاربر: @{message.from_user.username or 'ندارد'}\n"
@@ -743,23 +721,72 @@ async def show_products_message(message: Message, category: str):
             (category,),
         ).fetchall()
 
-    title = "💎 مدیریت رنک‌ها" if category == "rank" else "🐾 مدیریت پت‌ها"
     await message.edit_text(
-        f"<b>{title}</b>\n\nمحصول موردنظر را انتخاب کن:",
+        "مدیریت محصولات:",
         reply_markup=admin_product_list_keyboard(rows, category),
-        parse_mode="HTML",
     )
 
 
-@admin_dp.callback_query(F.data.in_(["admin_rank", "admin_pet"]))
+@admin_dp.callback_query(F.data.in_(["admin_rank", "admin_coin", "admin_pet"]))
 async def admin_products(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
 
-    category = "rank" if callback.data == "admin_rank" else "pet"
+    category = {"admin_rank": "rank", "admin_coin": "coin", "admin_pet": "pet"}[callback.data]
     await show_products_message(callback.message, category)
     await callback.answer()
 
+
+@admin_dp.callback_query(F.data == "add:coin")
+async def add_coin_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await state.set_state(CoinStates.key)
+    await callback.message.answer("🪙 کلید بسته Coin را بفرست.\nمثال: coin100")
+    await callback.answer()
+
+@admin_dp.message(CoinStates.key)
+async def coin_key(message: Message, state: FSMContext):
+    key=(message.text or "").strip().lower()
+    if not key: await message.answer("❌ کلید خالی است."); return
+    await state.update_data(key=key)
+    await state.set_state(CoinStates.title)
+    await message.answer("📝 نام بسته را بفرست.\nمثال: بسته 100 Coin")
+
+@admin_dp.message(CoinStates.title)
+async def coin_title(message: Message, state: FSMContext):
+    title=(message.text or "").strip()
+    if not title: await message.answer("❌ نام خالی است."); return
+    await state.update_data(title=title)
+    await state.set_state(CoinStates.coin_amount)
+    await message.answer("🪙 مقدار Coin را فقط عدد بفرست.\nمثال: 100")
+
+@admin_dp.message(CoinStates.coin_amount)
+async def coin_amount(message: Message, state: FSMContext):
+    text=(message.text or "").strip().replace(",","").replace("٬","")
+    if not text.isdigit() or int(text)<=0: await message.answer("❌ مقدار Coin باید عدد مثبت باشد."); return
+    await state.update_data(coin_amount=int(text))
+    await state.set_state(CoinStates.price)
+    await message.answer("💰 قیمت این بسته را به تومان بفرست.\nمثال: 10000")
+
+@admin_dp.message(CoinStates.price)
+async def coin_price(message: Message, state: FSMContext):
+    text=(message.text or "").strip().replace(",","").replace("٬","")
+    if not text.isdigit() or int(text)<=0: await message.answer("❌ قیمت باید عدد مثبت باشد."); return
+    await state.update_data(price=int(text))
+    await state.set_state(CoinStates.description)
+    await message.answer("📄 توضیحات بسته را بفرست؛ اگر نداری یک - بفرست.")
+
+@admin_dp.message(CoinStates.description)
+async def coin_description(message: Message, state: FSMContext):
+    d=await state.get_data(); desc=(message.text or "").strip()
+    if desc == "-": desc=""
+    try:
+        with get_db() as db:
+            db.execute("INSERT INTO products(product_key,category,title,price,description,coin_amount,enabled) VALUES(?,?,?,?,?,?,1)", (d["key"],"coin",d["title"],d["price"],desc,d["coin_amount"]))
+            db.commit()
+        await state.clear(); await message.answer("✅ بسته Coin اضافه شد.", reply_markup=admin_menu())
+    except sqlite3.IntegrityError:
+        await state.clear(); await message.answer("❌ این کلید قبلاً استفاده شده است.", reply_markup=admin_menu())
 
 @admin_dp.callback_query(F.data.startswith("add:"))
 async def add_product_start(callback: CallbackQuery, state: FSMContext):
@@ -799,7 +826,7 @@ async def add_product_title(message: Message, state: FSMContext):
 
     await state.update_data(title=value)
     await state.set_state(ProductStates.price)
-    await message.answer(f"💰 قیمت را به {get_setting('coin_name', DEFAULT_COIN_NAME)} و فقط به صورت عدد بفرست.\nمثال: 1000")
+    await message.answer("💰 قیمت را فقط به تومان و عدد بفرست.\nمثال: 100000")
 
 
 @admin_dp.message(ProductStates.price)
@@ -892,8 +919,9 @@ async def edit_product(callback: CallbackQuery):
     await callback.message.edit_text(
         f"📦 <b>{product['title']}</b>\n\n"
         f"🔑 Key: <code>{product['product_key']}</code>\n"
-        f"💰 قیمت: {currency_label(product['price'])}\n"
-        f"📊 وضعیت: {status}\n\n"
+        f"💰 قیمت: {money(product['price'])} تومان\n"
+        + (f"🪙 Coin: {money(product['coin_amount'])}\n" if product["category"] == "coin" else "")
+        + f"📊 وضعیت: {status}\n\n"
         f"{product['description']}",
         reply_markup=keyboard,
         parse_mode="HTML",
@@ -936,7 +964,7 @@ async def edit_price_start(callback: CallbackQuery, state: FSMContext):
     product_id = int(callback.data.split(":", 1)[1])
     await state.update_data(product_id=product_id)
     await state.set_state(EditProductStates.price)
-    await callback.message.answer(f"💰 قیمت جدید را به {get_setting('coin_name', DEFAULT_COIN_NAME)} و فقط به صورت عدد بفرست.")
+    await callback.message.answer("💰 قیمت جدید را فقط به صورت عدد بفرست.")
     await callback.answer()
 
 
@@ -1099,7 +1127,7 @@ async def admin_orders(callback: CallbackQuery):
         for order in orders:
             text += (
                 f"#{order['id']} | {order['product_name']}\n"
-                f"💰 {currency_label(order['amount'])}\n"
+                f"💰 {money(order['amount'])} تومان\n"
                 f"👤 {order['username'] or 'ندارد'}\n"
                 f"📌 وضعیت: {order['status']}\n\n"
             )
@@ -1164,7 +1192,7 @@ async def approve_order(callback: CallbackQuery):
             caption=(
                 f"🧾 <b>سفارش #{order_id}</b>\n\n"
                 f"📦 محصول: <b>{order['product_name']}</b>\n"
-                f"💰 مبلغ: <b>{currency_label(order['amount'])}</b>\n"
+                f"💰 مبلغ: <b>{money(order['amount'])} تومان</b>\n"
                 "✅ <b>تایید شد</b>"
             ),
             parse_mode="HTML",
@@ -1205,7 +1233,7 @@ async def reject_order(callback: CallbackQuery):
             caption=(
                 f"🧾 <b>سفارش #{order_id}</b>\n\n"
                 f"📦 محصول: <b>{order['product_name']}</b>\n"
-                f"💰 مبلغ: <b>{currency_label(order['amount'])}</b>\n"
+                f"💰 مبلغ: <b>{money(order['amount'])} تومان</b>\n"
                 "❌ <b>رد شد</b>"
             ),
             parse_mode="HTML",
@@ -1339,76 +1367,6 @@ async def delete_coupon(callback: CallbackQuery):
 
     await callback.answer(f"کوپن {code} حذف شد.")
     await admin_coupons(callback)
-
-
-# =========================
-# CURRENCY SETTINGS
-# =========================
-
-@admin_dp.callback_query(F.data == "admin_currency")
-async def admin_currency(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    name = get_setting("coin_name", DEFAULT_COIN_NAME)
-    icon = get_setting("coin_icon", DEFAULT_COIN_ICON)
-
-    await callback.message.edit_text(
-        "🪙 <b>تنظیمات واحد پول سرور</b>\n\n"
-        f"نام واحد پول: <b>{name}</b>\n"
-        f"آیکن: {icon}\n\n"
-        "قیمت همه رنک‌ها و پت‌ها با همین واحد نمایش داده می‌شود.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ تغییر نام کوین", callback_data="change_coin_name")],
-            [InlineKeyboardButton(text="🎨 تغییر آیکن کوین", callback_data="change_coin_icon")],
-            [InlineKeyboardButton(text="🔙 پنل", callback_data="admin_home")],
-        ]),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@admin_dp.callback_query(F.data == "change_coin_name")
-async def change_coin_name(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(CurrencyStates.name)
-    await callback.message.answer("🪙 نام واحد پول جدید را بفرست.\nمثال: کوین")
-    await callback.answer()
-
-
-@admin_dp.message(CurrencyStates.name)
-async def save_coin_name(message: Message, state: FSMContext):
-    value = (message.text or "").strip()
-    if not value:
-        await message.answer("❌ نام واحد پول نمی‌تواند خالی باشد.")
-        return
-    if len(value) > 30:
-        await message.answer("❌ نام واحد پول خیلی طولانی است.")
-        return
-    set_setting("coin_name", value)
-    await state.clear()
-    await message.answer(f"✅ واحد پول به «{value}» تغییر کرد.", reply_markup=admin_menu())
-
-
-@admin_dp.callback_query(F.data == "change_coin_icon")
-async def change_coin_icon(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(CurrencyStates.icon)
-    await callback.message.answer("🎨 آیکن واحد پول را بفرست.\nمثال: 🪙")
-    await callback.answer()
-
-
-@admin_dp.message(CurrencyStates.icon)
-async def save_coin_icon(message: Message, state: FSMContext):
-    value = (message.text or "").strip()
-    if not value:
-        await message.answer("❌ آیکن نمی‌تواند خالی باشد.")
-        return
-    set_setting("coin_icon", value)
-    await state.clear()
-    await message.answer(f"✅ آیکن واحد پول به {value} تغییر کرد.", reply_markup=admin_menu())
 
 
 # =========================
